@@ -1,0 +1,1 @@
+There are two separate datasets: Euro28 and US26. Each contains 100 simulations conducted on the same network. There is a file with connection requests, and with results – metrics calculated after running a simulation on these requests. 

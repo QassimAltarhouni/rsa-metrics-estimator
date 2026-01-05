@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Data & outputs
+RSA_estimation/
+_data/
+_out/
+_out_v2/
+.extracted_ok
+dummy.zip
+
+# OS
+.DS_Store
+Thumbs.db
