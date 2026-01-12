@@ -1,14 +1,20 @@
-# path: train_rsa_estimator_v4.py
-r"""
-V4: 3 algorithms + RepeatedKFold CV (mean±std) + optional sample weighting + optional SelectKBest.
+# path: train_rsa_estimator_v3.py
+"""
+V3: 3 algorithms + pick best per target + prediction bundle.
 
-Train:
-  python .\train_rsa_estimator_v4.py --zip .\dummy.zip --workdir . --outdir .\_out_v4 --seed 42 ^
-    --cv_splits 5 --cv_repeats 10 --use_weights --weight_alpha 1.0 --select_k 150
+Run training:
+  python .\train_rsa_estimator_v3.py --zip .\dummy.zip --workdir . --outdir .\_out_v3 --test_size 0.2 --seed 42
 
-Predict (optional):
-  python .\train_rsa_estimator_v4.py --zip .\dummy.zip --workdir . --outdir .\_out_v4 --seed 42 ^
-    --use_weights --weight_alpha 1.0 --select_k 150 --predict_requests .\some_requests.csv
+Train + predict on a requests.csv:
+  python .\train_rsa_estimator_v3.py --zip .\dummy.zip --workdir . --outdir .\_out_v3 --predict_requests .\some_requests.csv
+
+Outputs (per topology):
+  - bundle_<topology>.joblib           (best model per target + columns + transforms)
+  - metrics_all.csv                    (all models x targets)
+  - metrics_best.csv                   (best-per-target summary)
+  - preds_test.csv                     (test split predictions)
+  - features_full.csv                  (features + targets for debugging)
+  - predict_<timestamp>.csv            (if --predict_requests given)
 """
 
 from __future__ import annotations
@@ -22,20 +28,21 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple, Any, Optional
 
 import joblib
 import networkx as nx
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.decomposition import NMF
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.feature_selection import SelectKBest, mutual_info_regression
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import RepeatedKFold, train_test_split
+from sklearn.model_selection import train_test_split
+from sklearn.multioutput import MultiOutputRegressor
 
 TARGETS = ["highestSlot", "avgHighestSlot", "sumOfSlots", "avgActiveTransceivers"]
-LOG1P_TARGETS = {"highestSlot", "avgHighestSlot", "sumOfSlots"}
+LOG1P_TARGETS = {"highestSlot", "avgHighestSlot", "sumOfSlots"}  # slot-like
 
 
 # -----------------------------
@@ -53,6 +60,8 @@ def _find_rsa_estimation_dir(workdir: Path) -> Optional[Path]:
     direct = workdir / "RSA_estimation"
     if direct.exists():
         return direct
+
+    # common: extracted repo root contains RSA_estimation/
     for p in workdir.rglob("RSA_estimation"):
         if p.is_dir():
             return p
@@ -60,6 +69,9 @@ def _find_rsa_estimation_dir(workdir: Path) -> Optional[Path]:
 
 
 def ensure_extracted(zip_path: Path, workdir: Path) -> Path:
+    """
+    Extract zip if needed, then find RSA_estimation folder (even if nested).
+    """
     workdir.mkdir(parents=True, exist_ok=True)
     marker = workdir / ".extracted_ok"
 
@@ -67,10 +79,12 @@ def ensure_extracted(zip_path: Path, workdir: Path) -> Path:
     if found is not None and marker.exists():
         return found
     if found is not None and not marker.exists():
+        # accept already-extracted state
         return found
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(workdir)
+
     marker.write_text("ok", encoding="utf-8")
 
     found = _find_rsa_estimation_dir(workdir)
@@ -184,7 +198,7 @@ def adjacency_eigenspectrum_features(req: pd.DataFrame, k: int = 12) -> Dict[str
 
 
 # -----------------------------
-# Graph features
+# V2/V3 graph features
 # -----------------------------
 def hashed_wl_features(g: nx.DiGraph, n_bins: int = 128, iters: int = 2) -> Dict[str, float]:
     if g.number_of_nodes() == 0:
@@ -506,24 +520,80 @@ def load_dataset(
 
 
 # -----------------------------
-# Targets
+# Target transforms
 # -----------------------------
-def transform_y(y: np.ndarray, target: str) -> Tuple[np.ndarray, bool]:
-    if target in LOG1P_TARGETS:
-        return np.log1p(np.maximum(y.astype(float), 0.0)), True
+def transform_targets(y: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    y2 = y.copy()
+    idx = [i for i, t in enumerate(TARGETS) if t in LOG1P_TARGETS]
+    if idx:
+        y2[:, idx] = np.log1p(np.maximum(y2[:, idx], 0.0))
+    return y2, idx
+
+
+def inverse_transform_targets(y_pred: np.ndarray, idx: List[int]) -> np.ndarray:
+    y2 = y_pred.copy()
+    if idx:
+        y2[:, idx] = np.expm1(y2[:, idx])
+    return y2
+
+
+def transform_single_target(y: np.ndarray, target_name: str) -> Tuple[np.ndarray, bool]:
+    if target_name in LOG1P_TARGETS:
+        return np.log1p(np.maximum(y, 0.0)), True
     return y.astype(float), False
 
 
-def inverse_transform_y(y_pred: np.ndarray, was_log: bool) -> np.ndarray:
+def inverse_transform_single_target(y_pred: np.ndarray, was_log: bool) -> np.ndarray:
     if was_log:
-        return np.expm1(y_pred.astype(float))
-    return y_pred.astype(float)
+        return np.expm1(y_pred)
+    return y_pred
 
 
 # -----------------------------
 # Models (3 algorithms)
 # -----------------------------
-def make_regressor(model_name: str, seed: int, n_estimators: int, max_features: float, bootstrap: bool) -> Any:
+def make_multioutput_models(
+    seed: int,
+    n_estimators: int,
+    max_features: float,
+    bootstrap: bool,
+) -> Dict[str, Any]:
+    models: Dict[str, Any] = {
+        "ExtraTrees": ExtraTreesRegressor(
+            n_estimators=n_estimators,
+            random_state=seed,
+            n_jobs=-1,
+            max_features=max_features,
+            bootstrap=bootstrap,
+            min_samples_leaf=1,
+        ),
+        "RandomForest": RandomForestRegressor(
+            n_estimators=max(400, n_estimators // 2),
+            random_state=seed,
+            n_jobs=-1,
+            max_features=max_features,
+            bootstrap=bootstrap,
+            min_samples_leaf=1,
+        ),
+        "HistGB": MultiOutputRegressor(
+            HistGradientBoostingRegressor(
+                random_state=seed,
+                max_iter=600,
+                learning_rate=0.05,
+                max_depth=None,
+            )
+        ),
+    }
+    return models
+
+
+def make_single_target_model(
+    model_name: str,
+    seed: int,
+    n_estimators: int,
+    max_features: float,
+    bootstrap: bool,
+) -> Any:
     if model_name == "ExtraTrees":
         return ExtraTreesRegressor(
             n_estimators=n_estimators,
@@ -553,171 +623,198 @@ def make_regressor(model_name: str, seed: int, n_estimators: int, max_features: 
 
 
 # -----------------------------
-# Weighting / CV evaluation
+# Metrics / selection
 # -----------------------------
-def compute_sample_weight(y_raw: np.ndarray, alpha: float) -> np.ndarray:
-    y = np.asarray(y_raw, dtype=float)
-    med = float(np.median(y)) if y.size else 0.0
-    denom = med + 1e-9
-    w = 1.0 + alpha * (y / denom)
-    return np.clip(w, 0.1, 50.0)
+def _metrics_row(model: str, target: str, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
+    mae = float(mean_absolute_error(y_true, y_pred))
+    rmse = float(math.sqrt(mean_squared_error(y_true, y_pred)))
+    r2 = float(r2_score(y_true, y_pred))
+    return {"model": model, "target": target, "MAE": mae, "RMSE": rmse, "R2": r2}
 
 
-def eval_cv_single_target(
-    X: np.ndarray,
-    y_raw: np.ndarray,
-    target: str,
-    model_name: str,
-    seed: int,
-    n_estimators: int,
-    max_features: float,
-    bootstrap: bool,
-    rkf: RepeatedKFold,
-    select_k: int,
-    use_weights: bool,
-    weight_alpha: float,
-) -> Dict[str, Any]:
-    y_t, was_log = transform_y(y_raw, target)
-    w_full = compute_sample_weight(y_raw, weight_alpha) if use_weights else None
-
-    maes: List[float] = []
-    rmses: List[float] = []
-    r2s: List[float] = []
-
-    for tr, te in rkf.split(X):
-        X_tr, X_te = X[tr], X[te]
-        y_tr, y_te = y_t[tr], y_t[te]
-        w_tr = w_full[tr] if w_full is not None else None
-
-        selector = None
-        if 0 < select_k < X.shape[1]:
-            selector = SelectKBest(score_func=mutual_info_regression, k=select_k)
-            selector.fit(X_tr, y_tr)
-            X_tr = selector.transform(X_tr)
-            X_te = selector.transform(X_te)
-
-        reg = make_regressor(model_name, seed, n_estimators, max_features, bootstrap)
-
-        if w_tr is not None:
-            reg.fit(X_tr, y_tr, sample_weight=w_tr)
-        else:
-            reg.fit(X_tr, y_tr)
-
-        pred_t = np.asarray(reg.predict(X_te), dtype=float)
-        pred = inverse_transform_y(pred_t, was_log)
-        true = inverse_transform_y(np.asarray(y_te, dtype=float), was_log)
-
-        maes.append(float(mean_absolute_error(true, pred)))
-        rmses.append(float(math.sqrt(mean_squared_error(true, pred))))
-        r2s.append(float(r2_score(true, pred)))
-
-    return {
-        "model": model_name,
-        "target": target,
-        "MAE_mean": float(np.mean(maes)),
-        "MAE_std": float(np.std(maes, ddof=0)),
-        "RMSE_mean": float(np.mean(rmses)),
-        "RMSE_std": float(np.std(rmses, ddof=0)),
-        "R2_mean": float(np.mean(r2s)),
-        "R2_std": float(np.std(r2s, ddof=0)),
-    }
-
-
-def pick_best_per_target_cv(df_cv: pd.DataFrame) -> pd.DataFrame:
-    out = []
+def pick_best_models_per_target(df_metrics: pd.DataFrame) -> pd.DataFrame:
+    """
+    Best = highest R2; tie-breaker lowest RMSE.
+    """
+    out_rows = []
     for t in TARGETS:
-        d = df_cv[df_cv["target"] == t].copy()
-        d = d.sort_values(["R2_mean", "RMSE_mean"], ascending=[False, True])
-        out.append(d.iloc[0].to_dict())
-    return pd.DataFrame(out)
+        d = df_metrics[df_metrics["target"] == t].copy()
+        d = d.sort_values(["R2", "RMSE"], ascending=[False, True])
+        best = d.iloc[0].to_dict()
+        out_rows.append(best)
+    return pd.DataFrame(out_rows)
 
 
-def fit_final_bundle(
-    X: np.ndarray,
-    feat_cols: List[str],
-    y: np.ndarray,
-    df_meta: pd.DataFrame,
-    best_map: Dict[str, str],
+# -----------------------------
+# Predict helpers
+# -----------------------------
+def features_from_requests_csv(
+    requests_csv: Path,
+    eig_k: int,
+    wl_bins: int,
+    nmf_k: int,
     seed: int,
-    n_estimators: int,
-    max_features: float,
-    bootstrap: bool,
-    select_k: int,
-    use_weights: bool,
-    weight_alpha: float,
-) -> Dict[str, Any]:
-    topology_name = df_meta["topology"].iloc[0] if len(df_meta) else "unknown"
-
-    models: Dict[str, Any] = {}
-    selectors: Dict[str, Any] = {}
-    feature_cols_per_target: Dict[str, List[str]] = {}
-    was_log_per_target: Dict[str, bool] = {}
-
-    for i, t in enumerate(TARGETS):
-        model_name = best_map[t]
-        y_raw = y[:, i]
-        y_t, was_log = transform_y(y_raw, t)
-        w = compute_sample_weight(y_raw, weight_alpha) if use_weights else None
-
-        selector = None
-        X_fit = X
-        selected_cols = feat_cols
-
-        if 0 < select_k < X.shape[1]:
-            selector = SelectKBest(score_func=mutual_info_regression, k=select_k)
-            selector.fit(X, y_t)
-            idx = selector.get_support(indices=True)
-            selected_cols = [feat_cols[j] for j in idx]
-            X_fit = selector.transform(X)
-
-        reg = make_regressor(model_name, seed, n_estimators, max_features, bootstrap)
-        if w is not None:
-            reg.fit(X_fit, y_t, sample_weight=w)
-        else:
-            reg.fit(X_fit, y_t)
-
-        models[t] = reg
-        selectors[t] = selector
-        feature_cols_per_target[t] = selected_cols
-        was_log_per_target[t] = was_log
-
-    return {
-        "topology": topology_name,
-        "targets": TARGETS,
-        "log1p_targets": sorted(LOG1P_TARGETS),
-        "model_name_per_target": best_map,
-        "was_log_per_target": was_log_per_target,
-        "feature_columns_full": feat_cols,
-        "feature_columns_per_target": feature_cols_per_target,
-        "selectors_per_target": selectors,
-        "models_per_target": models,
-        "train_seed": seed,
-    }
-
-
-def predict_with_bundle(bundle_path: Path, requests_csv: Path, eig_k: int, wl_bins: int, nmf_k: int, seed: int, outdir: Path) -> Path:
-    bundle = joblib.load(bundle_path)
-
+) -> Dict[str, float]:
     req = pd.read_csv(requests_csv)
     req["source"] = req["source"].astype(int)
     req["destination"] = req["destination"].astype(int)
     req["bitrate"] = req["bitrate"].astype(float)
+    return extract_features(req, eig_k=eig_k, wl_bins=wl_bins, nmf_k=nmf_k, seed=seed)
 
-    feat = extract_features(req, eig_k=eig_k, wl_bins=wl_bins, nmf_k=nmf_k, seed=seed)
-    full_cols = bundle["feature_columns_full"]
-    x_full = pd.DataFrame([{c: float(feat.get(c, 0.0)) for c in full_cols}], columns=full_cols).to_numpy(dtype=float)
+
+def align_feature_vector(feat: Dict[str, float], feature_columns: List[str]) -> np.ndarray:
+    row = {c: float(feat.get(c, 0.0)) for c in feature_columns}
+    return pd.DataFrame([row], columns=feature_columns).to_numpy(dtype=float)
+
+
+# -----------------------------
+# Training pipeline
+# -----------------------------
+def train_and_select(
+    samples: List[Sample],
+    outdir: Path,
+    seed: int,
+    test_size: float,
+    n_estimators: int,
+    max_features: float,
+    bootstrap: bool,
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    df_feat = pd.DataFrame([s.features for s in samples]).fillna(0.0)
+    df_meta = pd.DataFrame([{"topology": s.topology, "request_set": s.request_set} for s in samples])
+    df_y = pd.DataFrame([s.targets for s in samples])[TARGETS]
+
+    feature_columns = list(df_feat.columns)
+
+    X = df_feat.to_numpy(dtype=float)
+    y = df_y.to_numpy(dtype=float)
+
+    X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
+        X, y, df_meta, test_size=test_size, random_state=seed, shuffle=True
+    )
+
+    y_train_t, t_idx = transform_targets(y_train)
+
+    models = make_multioutput_models(seed, n_estimators, max_features, bootstrap)
+
+    # Evaluate all 3 models
+    metrics_rows: List[Dict[str, Any]] = []
+    for name, model in models.items():
+        model.fit(X_train, y_train_t)
+        y_pred_t = np.asarray(model.predict(X_test), dtype=float)
+        y_pred = inverse_transform_targets(y_pred_t, t_idx)
+
+        for i, t in enumerate(TARGETS):
+            metrics_rows.append(_metrics_row(name, t, y_test[:, i], y_pred[:, i]))
+
+    df_metrics = pd.DataFrame(metrics_rows).sort_values(["target", "model"]).reset_index(drop=True)
+    df_best = pick_best_models_per_target(df_metrics)
+
+    print("\n=== Metrics (all models) ===")
+    print(df_metrics.to_string(index=False))
+    print("\n=== Best model per target ===")
+    print(df_best.to_string(index=False))
+
+    # Save test predictions from the single best-per-target ensemble
+    best_map = {row["target"]: row["model"] for row in df_best.to_dict(orient="records")}
+
+    # Train best models per target on TRAIN split, predict TEST split (for consistent report)
+    test_pred = meta_test.reset_index(drop=True).copy()
+    for i, t in enumerate(TARGETS):
+        model_name = best_map[t]
+        reg = make_single_target_model(model_name, seed, n_estimators, max_features, bootstrap)
+
+        y_tr_1 = y_train[:, i]
+        y_tr_t, was_log = transform_single_target(y_tr_1, t)
+
+        reg.fit(X_train, y_tr_t)
+        y_pred_t_1 = np.asarray(reg.predict(X_test), dtype=float)
+        y_pred_1 = inverse_transform_single_target(y_pred_t_1, was_log)
+
+        test_pred[f"y_true_{t}"] = y_test[:, i]
+        test_pred[f"y_pred_{t}"] = y_pred_1
+        test_pred[f"best_model_{t}"] = model_name
+
+    # Fit FINAL best-per-target models on FULL dataset
+    final_models: Dict[str, Any] = {}
+    final_model_names: Dict[str, str] = {}
+    final_transform_flags: Dict[str, bool] = {}
+
+    for i, t in enumerate(TARGETS):
+        model_name = best_map[t]
+        reg = make_single_target_model(model_name, seed, n_estimators, max_features, bootstrap)
+
+        y_full_1 = y[:, i]
+        y_full_t, was_log = transform_single_target(y_full_1, t)
+
+        reg.fit(X, y_full_t)
+
+        final_models[t] = reg
+        final_model_names[t] = model_name
+        final_transform_flags[t] = was_log
+
+    topology_name = df_meta["topology"].iloc[0] if len(df_meta) else "unknown"
+
+    bundle = {
+        "topology": topology_name,
+        "feature_columns": feature_columns,
+        "targets": TARGETS,
+        "log1p_targets": sorted(LOG1P_TARGETS),
+        "model_name_per_target": final_model_names,
+        "was_log_per_target": final_transform_flags,
+        "models": final_models,
+        "train_seed": seed,
+    }
+
+    # Save artifacts
+    (outdir / "metrics_all.csv").write_text(df_metrics.to_csv(index=False), encoding="utf-8")
+    (outdir / "metrics_best.csv").write_text(df_best.to_csv(index=False), encoding="utf-8")
+    test_pred.to_csv(outdir / "preds_test.csv", index=False)
+
+    df_full = pd.concat([df_meta, df_feat, df_y], axis=1)
+    df_full.to_csv(outdir / "features_full.csv", index=False)
+
+    joblib.dump(bundle, outdir / f"bundle_{topology_name}.joblib")
+    (outdir / "best_models.json").write_text(json.dumps(best_map, indent=2), encoding="utf-8")
+
+    print(f"\nSaved: {outdir / 'metrics_all.csv'}")
+    print(f"Saved: {outdir / 'metrics_best.csv'}")
+    print(f"Saved: {outdir / 'preds_test.csv'}")
+    print(f"Saved: {outdir / 'features_full.csv'}")
+    print(f"Saved: {outdir / f'bundle_{topology_name}.joblib'}")
+    print(f"Saved: {outdir / 'best_models.json'}")
+
+
+def predict_with_bundle(
+    bundle_path: Path,
+    requests_csv: Path,
+    outdir: Path,
+    eig_k: int,
+    wl_bins: int,
+    nmf_k: int,
+    seed: int,
+) -> Path:
+    bundle = joblib.load(bundle_path)
+
+    feat = features_from_requests_csv(requests_csv, eig_k=eig_k, wl_bins=wl_bins, nmf_k=nmf_k, seed=seed)
+    x = align_feature_vector(feat, bundle["feature_columns"])
 
     rows = []
     for t in bundle["targets"]:
-        selector = bundle["selectors_per_target"][t]
-        model = bundle["models_per_target"][t]
+        reg = bundle["models"][t]
         was_log = bool(bundle["was_log_per_target"][t])
 
-        x = selector.transform(x_full) if selector is not None else x_full
-        pred_t = float(np.asarray(model.predict(x), dtype=float).reshape(-1)[0])
-        pred = float(inverse_transform_y(np.array([pred_t], dtype=float), was_log)[0])
+        y_pred_t = float(np.asarray(reg.predict(x), dtype=float).reshape(-1)[0])
+        y_pred = float(inverse_transform_single_target(np.array([y_pred_t], dtype=float), was_log)[0])
 
-        rows.append({"target": t, "y_pred": pred, "model": bundle["model_name_per_target"][t]})
+        rows.append(
+            {
+                "target": t,
+                "y_pred": y_pred,
+                "model": bundle["model_name_per_target"][t],
+            }
+        )
 
     df = pd.DataFrame(rows)
     print("\n=== Prediction ===")
@@ -731,152 +828,26 @@ def predict_with_bundle(bundle_path: Path, requests_csv: Path, eig_k: int, wl_bi
     return out_path
 
 
-def train_pipeline(
-    samples: List[Sample],
-    outdir: Path,
-    seed: int,
-    test_size: float,
-    n_estimators: int,
-    max_features: float,
-    bootstrap: bool,
-    cv_splits: int,
-    cv_repeats: int,
-    select_k: int,
-    use_weights: bool,
-    weight_alpha: float,
-) -> None:
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    df_feat = pd.DataFrame([s.features for s in samples]).fillna(0.0)
-    df_meta = pd.DataFrame([{"topology": s.topology, "request_set": s.request_set} for s in samples])
-    df_y = pd.DataFrame([s.targets for s in samples])[TARGETS]
-
-    X = df_feat.to_numpy(dtype=float)
-    y = df_y.to_numpy(dtype=float)
-    feat_cols = list(df_feat.columns)
-
-    rkf = RepeatedKFold(n_splits=cv_splits, n_repeats=cv_repeats, random_state=seed)
-    model_names = ["ExtraTrees", "RandomForest", "HistGB"]
-
-    cv_rows: List[Dict[str, Any]] = []
-    for t_i, t in enumerate(TARGETS):
-        y_raw = y[:, t_i]
-        for m in model_names:
-            cv_rows.append(
-                eval_cv_single_target(
-                    X=X,
-                    y_raw=y_raw,
-                    target=t,
-                    model_name=m,
-                    seed=seed,
-                    n_estimators=n_estimators,
-                    max_features=max_features,
-                    bootstrap=bootstrap,
-                    rkf=rkf,
-                    select_k=select_k,
-                    use_weights=use_weights,
-                    weight_alpha=weight_alpha,
-                )
-            )
-
-    df_cv = pd.DataFrame(cv_rows).sort_values(["target", "model"]).reset_index(drop=True)
-    df_best = pick_best_per_target_cv(df_cv)
-    best_map = {row["target"]: row["model"] for row in df_best.to_dict(orient="records")}
-
-    print("\n=== CV Metrics (mean±std across folds) ===")
-    print(df_cv.to_string(index=False))
-    print("\n=== Best model per target (from CV) ===")
-    print(df_best.to_string(index=False))
-
-    df_cv.to_csv(outdir / "cv_metrics_all.csv", index=False)
-    df_best.to_csv(outdir / "cv_metrics_best.csv", index=False)
-    (outdir / "best_models_cv.json").write_text(json.dumps(best_map, indent=2), encoding="utf-8")
-
-    # Holdout (sanity only)
-    X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
-        X, y, df_meta, test_size=test_size, random_state=seed, shuffle=True
-    )
-    preds = meta_test.reset_index(drop=True).copy()
-
-    for i, t in enumerate(TARGETS):
-        model_name = best_map[t]
-        y_tr_raw = y_train[:, i]
-        y_tr_t, was_log = transform_y(y_tr_raw, t)
-        w_tr = compute_sample_weight(y_tr_raw, weight_alpha) if use_weights else None
-
-        selector = None
-        X_tr = X_train
-        X_te = X_test
-        if 0 < select_k < X.shape[1]:
-            selector = SelectKBest(score_func=mutual_info_regression, k=select_k)
-            selector.fit(X_tr, y_tr_t)
-            X_tr = selector.transform(X_tr)
-            X_te = selector.transform(X_te)
-
-        reg = make_regressor(model_name, seed, n_estimators, max_features, bootstrap)
-        if w_tr is not None:
-            reg.fit(X_tr, y_tr_t, sample_weight=w_tr)
-        else:
-            reg.fit(X_tr, y_tr_t)
-
-        pred_t = np.asarray(reg.predict(X_te), dtype=float)
-        pred = inverse_transform_y(pred_t, was_log)
-
-        preds[f"y_true_{t}"] = y_test[:, i]
-        preds[f"y_pred_{t}"] = pred
-        preds[f"best_model_{t}"] = model_name
-
-    preds.to_csv(outdir / "preds_holdout.csv", index=False)
-
-    bundle = fit_final_bundle(
-        X=X,
-        feat_cols=feat_cols,
-        y=y,
-        df_meta=df_meta,
-        best_map=best_map,
-        seed=seed,
-        n_estimators=n_estimators,
-        max_features=max_features,
-        bootstrap=bootstrap,
-        select_k=select_k,
-        use_weights=use_weights,
-        weight_alpha=weight_alpha,
-    )
-
-    topo = bundle["topology"]
-    joblib.dump(bundle, outdir / f"bundle_{topo}.joblib")
-
-    print(f"\nSaved: {outdir / 'cv_metrics_all.csv'}")
-    print(f"Saved: {outdir / 'cv_metrics_best.csv'}")
-    print(f"Saved: {outdir / 'best_models_cv.json'}")
-    print(f"Saved: {outdir / 'preds_holdout.csv'}")
-    print(f"Saved: {outdir / f'bundle_{topo}.joblib'}")
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--zip", type=str, required=True)
-    p.add_argument("--workdir", type=str, default=".")
-    p.add_argument("--outdir", type=str, default="./_out_v4")
+    p.add_argument("--zip", type=str, required=True, help="Path to RSA_estimation zip (can be dummy if extracted).")
+    p.add_argument("--workdir", type=str, default=".", help="Extraction directory containing RSA_estimation/")
+    p.add_argument("--outdir", type=str, default="./_out_v3", help="Output directory")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--test_size", type=float, default=0.2)
 
+    # feature params
     p.add_argument("--eig_k", type=int, default=24)
     p.add_argument("--wl_bins", type=int, default=128)
     p.add_argument("--nmf_k", type=int, default=6)
 
+    # model params
     p.add_argument("--n_estimators", type=int, default=1200)
     p.add_argument("--max_features", type=float, default=0.7)
     p.add_argument("--bootstrap", action="store_true")
 
-    p.add_argument("--cv_splits", type=int, default=5)
-    p.add_argument("--cv_repeats", type=int, default=10)
-
-    p.add_argument("--select_k", type=int, default=0, help="Enable SelectKBest; 0 disables.")
-    p.add_argument("--use_weights", action="store_true", help="Enable sample weights.")
-    p.add_argument("--weight_alpha", type=float, default=1.0)
-
-    p.add_argument("--predict_requests", type=str, default="")
+    # predict
+    p.add_argument("--predict_requests", type=str, default="", help="If set, run prediction for this requests.csv")
 
     args = p.parse_args()
     set_global_seed(args.seed)
@@ -902,7 +873,7 @@ def main() -> None:
         )
 
         topo_out = outdir / topology
-        train_pipeline(
+        train_and_select(
             samples=samples,
             outdir=topo_out,
             seed=args.seed,
@@ -910,11 +881,6 @@ def main() -> None:
             n_estimators=args.n_estimators,
             max_features=args.max_features,
             bootstrap=args.bootstrap,
-            cv_splits=args.cv_splits,
-            cv_repeats=args.cv_repeats,
-            select_k=args.select_k,
-            use_weights=args.use_weights,
-            weight_alpha=args.weight_alpha,
         )
 
         if args.predict_requests:
@@ -922,11 +888,11 @@ def main() -> None:
             predict_with_bundle(
                 bundle_path=bundle_path,
                 requests_csv=Path(args.predict_requests).expanduser().resolve(),
+                outdir=topo_out,
                 eig_k=args.eig_k,
                 wl_bins=args.wl_bins,
                 nmf_k=args.nmf_k,
                 seed=args.seed,
-                outdir=topo_out,
             )
 
 
