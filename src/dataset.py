@@ -1,28 +1,29 @@
+from __future__ import annotations
+
 from pathlib import Path
+
 import pandas as pd
 
+from src.config import TARGETS
 
-def load_dataset(root: Path, topology: str, seed: int = 42):
-    topo_dir = root / topology
 
+def load_dataset(root: Path, topology: str, seed: int = 42) -> pd.DataFrame:
+    """
+    Load training dataset from features_full.csv.
+    Expected: features_full.csv contains feature columns + TARGETS columns.
+    """
+    topo_dir = Path(root) / topology
     features_path = topo_dir / "features_full.csv"
-    metrics_path = topo_dir / "metrics_all.csv"
 
     if not features_path.exists():
         raise FileNotFoundError(f"Missing features file: {features_path}")
 
-    if not metrics_path.exists():
-        raise FileNotFoundError(f"Missing metrics file: {metrics_path}")
+    df = pd.read_csv(features_path)
+    if df.empty:
+        raise RuntimeError("features_full.csv is empty")
 
-    X = pd.read_csv(features_path)
-    y = pd.read_csv(metrics_path)
+    missing = [t for t in TARGETS if t not in df.columns]
+    if missing:
+        raise RuntimeError(f"Missing target columns in features_full.csv: {missing}")
 
-    if X.empty or y.empty:
-        raise RuntimeError("Features or metrics CSV is empty")
-
-    # Combine for convenience
-    dataset = pd.concat([X, y], axis=1)
-
-    print(f"Loaded dataset: {dataset.shape}")
-
-    return dataset
+    return df
