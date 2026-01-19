@@ -1,6 +1,6 @@
 {
   "highestSlot": "ExtraTrees",
   "avgHighestSlot": "RandomForest",
-  "sumOfSlots": "ExtraTrees",
+  "sumOfSlots": "RandomForest",
   "avgActiveTransceivers": "RandomForest"
 }

@@ -28,14 +28,14 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Any, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import joblib
 import networkx as nx
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.decomposition import NMF
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
@@ -61,7 +61,6 @@ def _find_rsa_estimation_dir(workdir: Path) -> Optional[Path]:
     if direct.exists():
         return direct
 
-    # common: extracted repo root contains RSA_estimation/
     for p in workdir.rglob("RSA_estimation"):
         if p.is_dir():
             return p
@@ -79,7 +78,6 @@ def ensure_extracted(zip_path: Path, workdir: Path) -> Path:
     if found is not None and marker.exists():
         return found
     if found is not None and not marker.exists():
-        # accept already-extracted state
         return found
 
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -158,6 +156,47 @@ def quantiles(x: np.ndarray, qs: Iterable[float]) -> Dict[str, float]:
         return {f"q{int(q*100):02d}": 0.0 for q in qs}
     vals = np.quantile(x, list(qs))
     return {f"q{int(q*100):02d}": float(v) for q, v in zip(qs, vals)}
+
+
+def mean_absolute_percentage_error_safe(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    eps: float = 1e-9,
+) -> float:
+    """
+    MAPE (%) with safe denominator clipping to handle zeros/near-zeros.
+
+    mean(|y - yhat| / max(|y|, eps)) * 100
+    """
+    yt = np.asarray(y_true, dtype=float).reshape(-1)
+    yp = np.asarray(y_pred, dtype=float).reshape(-1)
+    denom = np.maximum(np.abs(yt), eps)
+    return float(np.mean(np.abs(yt - yp) / denom) * 100.0)
+
+
+def weighted_absolute_percentage_error(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> float:
+    """
+    WAPE (%) = sum(|y - yhat|) / max(sum(|y|), eps) * 100
+
+    If sum(|y|) ~ 0:
+      - returns 0.0 if numerator ~ 0
+      - else returns +inf
+    """
+    yt = np.asarray(y_true, dtype=float).reshape(-1)
+    yp = np.asarray(y_pred, dtype=float).reshape(-1)
+
+    num = float(np.sum(np.abs(yt - yp)))
+    den = float(np.sum(np.abs(yt)))
+
+    if den <= eps:
+        return 0.0 if num <= eps else float("inf")
+    return float((num / den) * 100.0)
 
 
 # -----------------------------
@@ -629,7 +668,9 @@ def _metrics_row(model: str, target: str, y_true: np.ndarray, y_pred: np.ndarray
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(math.sqrt(mean_squared_error(y_true, y_pred)))
     r2 = float(r2_score(y_true, y_pred))
-    return {"model": model, "target": target, "MAE": mae, "RMSE": rmse, "R2": r2}
+    mape = mean_absolute_percentage_error_safe(y_true, y_pred)
+    wape = weighted_absolute_percentage_error(y_true, y_pred)
+    return {"model": model, "target": target, "MAE": mae, "RMSE": rmse, "R2": r2, "MAPE": mape, "WAPE": wape}
 
 
 def pick_best_models_per_target(df_metrics: pd.DataFrame) -> pd.DataFrame:
@@ -698,7 +739,6 @@ def train_and_select(
 
     models = make_multioutput_models(seed, n_estimators, max_features, bootstrap)
 
-    # Evaluate all 3 models
     metrics_rows: List[Dict[str, Any]] = []
     for name, model in models.items():
         model.fit(X_train, y_train_t)
@@ -716,10 +756,8 @@ def train_and_select(
     print("\n=== Best model per target ===")
     print(df_best.to_string(index=False))
 
-    # Save test predictions from the single best-per-target ensemble
     best_map = {row["target"]: row["model"] for row in df_best.to_dict(orient="records")}
 
-    # Train best models per target on TRAIN split, predict TEST split (for consistent report)
     test_pred = meta_test.reset_index(drop=True).copy()
     for i, t in enumerate(TARGETS):
         model_name = best_map[t]
@@ -736,7 +774,6 @@ def train_and_select(
         test_pred[f"y_pred_{t}"] = y_pred_1
         test_pred[f"best_model_{t}"] = model_name
 
-    # Fit FINAL best-per-target models on FULL dataset
     final_models: Dict[str, Any] = {}
     final_model_names: Dict[str, str] = {}
     final_transform_flags: Dict[str, bool] = {}
@@ -767,7 +804,6 @@ def train_and_select(
         "train_seed": seed,
     }
 
-    # Save artifacts
     (outdir / "metrics_all.csv").write_text(df_metrics.to_csv(index=False), encoding="utf-8")
     (outdir / "metrics_best.csv").write_text(df_best.to_csv(index=False), encoding="utf-8")
     test_pred.to_csv(outdir / "preds_test.csv", index=False)
@@ -836,17 +872,14 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--test_size", type=float, default=0.2)
 
-    # feature params
     p.add_argument("--eig_k", type=int, default=24)
     p.add_argument("--wl_bins", type=int, default=128)
     p.add_argument("--nmf_k", type=int, default=6)
 
-    # model params
     p.add_argument("--n_estimators", type=int, default=1200)
     p.add_argument("--max_features", type=float, default=0.7)
     p.add_argument("--bootstrap", action="store_true")
 
-    # predict
     p.add_argument("--predict_requests", type=str, default="", help="If set, run prediction for this requests.csv")
 
     args = p.parse_args()
