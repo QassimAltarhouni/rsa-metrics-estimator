@@ -1,12 +1,11 @@
-# path: src/train.py
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
 from src.dataset import load_dataset
-from src.models import train_and_select
 from src.math_utils import set_global_seed
+from src.models import train_and_select
 
 
 def main() -> None:
@@ -34,22 +33,12 @@ def main() -> None:
     topology = args.topology
     print(f"\n===== TRAINING TOPOLOGY: {topology} =====")
 
-    samples = load_dataset(
-        root=data_root,
-        topology=topology,
-        seed=args.seed,
-    )
-
+    samples = load_dataset(root=data_root, topology=topology, seed=args.seed)
     if samples.empty:
         raise RuntimeError("Dataset is empty. No samples were loaded.")
 
     outdir = Path(args.outdir).resolve() / topology
-    train_and_select(
-        samples=samples,
-        outdir=outdir,
-        test_size=args.test_size,
-        seed=args.seed,
-    )
+    train_and_select(samples=samples, outdir=outdir, test_size=args.test_size, seed=args.seed)
 
 
 if __name__ == "__main__":

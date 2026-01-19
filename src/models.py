@@ -1,4 +1,3 @@
-# path: src/models.py
 from __future__ import annotations
 
 import math
@@ -12,19 +11,15 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
-from src.config import LOG1P_TARGETS, TARGETS
+from src.config import TARGETS, LOG1P_TARGETS
 from src.math_utils import mean_absolute_percentage_error_safe, weighted_absolute_percentage_error
 
 
 def _split_xy(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
-    Build X, y from dataframe:
-      - y: TARGETS
-      - X: all numeric columns except TARGETS
-      - drop common meta columns if present
+    X = numeric columns excluding TARGETS (+ optional meta cols)
+    y = TARGETS
     """
-    df = df.copy()
-
     y_df = df[TARGETS].astype(float)
 
     drop_cols = set(TARGETS)
@@ -33,12 +28,10 @@ def _split_xy(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
             drop_cols.add(meta)
 
     x_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
-
-    # keep numeric only
     x_df = x_df.select_dtypes(include=[np.number]).fillna(0.0)
 
     if x_df.shape[1] == 0:
-        raise RuntimeError("No numeric feature columns found after dropping targets/meta.")
+        raise RuntimeError("No numeric feature columns found (after dropping targets/meta).")
 
     return x_df.to_numpy(dtype=float), y_df.to_numpy(dtype=float), list(x_df.columns)
 
@@ -74,10 +67,12 @@ def train_and_select(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """
-    Train model and write:
+    Train RandomForest MultiOutput (y is 2D) + evaluate and PRINT metrics including MAPE/WAPE.
+    Saves:
       - metrics_all.csv
       - metrics_best.csv
       - bundle.joblib
+      - preds_test.csv
     """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -101,17 +96,28 @@ def train_and_select(
     y_pred_t = np.asarray(model.predict(X_test), dtype=float)
     y_pred = _inverse_transform_targets(y_pred_t, t_idx)
 
+    # ---- PRINTED HERE ----
     rows: List[Dict[str, Any]] = []
     for i, t in enumerate(TARGETS):
         rows.append(_metrics_row(model_name, t, y_test[:, i], y_pred[:, i]))
 
     df_metrics = pd.DataFrame(rows).sort_values(["target"]).reset_index(drop=True)
+    df_best = df_metrics.copy()  # only one model
 
-    # only one model => best == itself
-    df_best = df_metrics.copy()
+    print("\n=== Metrics (all models) ===")
+    print(df_metrics.to_string(index=False))
 
+    print("\n=== Best model per target ===")
+    print(df_best.to_string(index=False))
+
+    # Save artifacts
     (outdir / "metrics_all.csv").write_text(df_metrics.to_csv(index=False), encoding="utf-8")
     (outdir / "metrics_best.csv").write_text(df_best.to_csv(index=False), encoding="utf-8")
+
+    preds = pd.DataFrame(y_test, columns=[f"y_true_{t}" for t in TARGETS])
+    for i, t in enumerate(TARGETS):
+        preds[f"y_pred_{t}"] = y_pred[:, i]
+    preds.to_csv(outdir / "preds_test.csv", index=False)
 
     bundle = {
         "model": model,
@@ -123,10 +129,9 @@ def train_and_select(
     }
     joblib.dump(bundle, outdir / "bundle.joblib")
 
-    print("\n=== Metrics (all) ===")
-    print(df_metrics.to_string(index=False))
     print(f"\nSaved: {outdir / 'metrics_all.csv'}")
     print(f"Saved: {outdir / 'metrics_best.csv'}")
+    print(f"Saved: {outdir / 'preds_test.csv'}")
     print(f"Saved: {outdir / 'bundle.joblib'}")
 
     return bundle
@@ -134,8 +139,7 @@ def train_and_select(
 
 def predict_with_bundle(bundle: Dict[str, Any], X: pd.DataFrame) -> np.ndarray:
     """
-    Run inference using saved model bundle.
-    X can be a DataFrame with at least bundle['feature_columns'].
+    Predict using saved bundle.
     """
     feature_columns: List[str] = list(bundle["feature_columns"])
     x_df = X.reindex(columns=feature_columns).fillna(0.0)
@@ -143,3 +147,4 @@ def predict_with_bundle(bundle: Dict[str, Any], X: pd.DataFrame) -> np.ndarray:
 
     y_pred_t = np.asarray(bundle["model"].predict(x), dtype=float)
     return _inverse_transform_targets(y_pred_t, list(bundle["transform_idx"]))
+
