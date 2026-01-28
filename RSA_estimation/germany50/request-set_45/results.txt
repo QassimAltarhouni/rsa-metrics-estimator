@@ -1,4 +1,0 @@
-highestSlot	686
-avgHighestSlot	161.737
-sumOfSlots	161737
-avgActiveTransceivers	1.0
